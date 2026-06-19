@@ -1,0 +1,15 @@
+{
+  "name": "clothing-inventory",
+  "version": "1.0.0",
+  "description": "מערכת לניהול מלאי ביגוד לפי חברות ניהול, כולל הזמנות, אישורים, חוסרים והזמנות רכש",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --no-warnings server.js",
+    "dev": "node --no-warnings --watch server.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "license": "MIT"
+}
