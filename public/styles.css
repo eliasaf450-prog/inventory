@@ -133,6 +133,9 @@ tbody tr:hover { background: rgba(255,255,255,0.02); }
 .section h3 { font-size: 17px; margin: 0 0 12px; }
 .muted { color: var(--muted); }
 .empty { color: var(--muted); padding: 30px; text-align: center; border: 1px dashed var(--border); border-radius: var(--radius); }
+.loading { color: var(--muted); padding: 40px; text-align: center; display: flex; align-items: center; justify-content: center; gap: 10px; }
+.loading .spinner { width: 22px; height: 22px; border: 3px solid var(--border); border-top-color: var(--accent, #4f7cff); border-radius: 50%; animation: spin 0.7s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 .qty-low { color: var(--red); font-weight: 700; }
 .qty-ok { color: var(--green); font-weight: 600; }
 

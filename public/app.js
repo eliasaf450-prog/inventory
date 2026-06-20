@@ -272,9 +272,25 @@ function alertRow(icon, text, goto) {
 /* ================================================================
    בקשת ביגוד (קטלוג למשתמש) – ניווט חברה → סוג → מוצרים → עגלה
    ================================================================ */
-const browseState = { company: null, itemType: null };
+const browseState = { company: null, itemType: null, cache: { companies: null, types: {}, products: {} } };
+
+// טעינה עם מטמון – פנייה אחת לשרת לכל רמה, ואז ניווט מיידי קדימה ואחורה
+async function getCompanies() {
+  if (!browseState.cache.companies) browseState.cache.companies = await api('/companies');
+  return browseState.cache.companies;
+}
+async function getTypes(companyId) {
+  if (!browseState.cache.types[companyId]) browseState.cache.types[companyId] = await api('/item-types?company_id=' + companyId);
+  return browseState.cache.types[companyId];
+}
+async function getProducts(typeId) {
+  if (!browseState.cache.products[typeId]) browseState.cache.products[typeId] = await api('/products?item_type_id=' + typeId);
+  return browseState.cache.products[typeId];
+}
 async function viewBrowse() {
   const main = $('#main');
+  // מתחילים מהרמה הראשונה ומאפסים מטמון כדי לקבל נתונים עדכניים בכל כניסה למסך
+  browseState.cache = { companies: null, types: {}, products: {} };
   main.innerHTML = `<h1 class="page-title">בקשת ביגוד</h1>
     <p class="page-sub">בחרו חברת ניהול, סוג פריט ומידות, וצרו בקשה</p>
     <div id="browse-body"></div>`;
@@ -288,22 +304,31 @@ async function drawBrowse() {
   if (browseState.itemType) crumbs += ` ‹ <span>${h(browseState.itemType.name)}</span>`;
   crumbs += `</div>`;
 
+  // מציגים מיד שלד עם חיווי טעינה כדי שהמסך לא ייראה תקוע
+  body.innerHTML = crumbs + `<div class="loading"><span class="spinner"></span> טוען…</div>`;
+
   let content = '';
+  try {
   if (!browseState.company) {
-    const companies = await api('/companies');
+    const companies = await getCompanies();
     content = companies.length
       ? `<div class="cards">${companies.map((c) =>
           `<button class="card" data-company='${h(JSON.stringify(c))}' style="cursor:pointer;text-align:right">
             <div style="font-size:18px;font-weight:700">🏢 ${h(c.name)}</div>
             <div class="muted" style="margin-top:6px">${c.item_type_count} סוגי פריטים</div></button>`).join('')}</div>`
       : `<div class="empty">אין חברות ניהול עדיין. מנהל המערכת יכול להוסיף ב"ניהול מלאי".</div>`;
+    // טעינה מקדימה ברקע של תת-הקטגוריות לכל חברה – כך הלחיצה הבאה מיידית
+    companies.forEach((c) => getTypes(c.id).catch(() => {}));
   } else if (!browseState.itemType) {
-    const types = await api('/item-types?company_id=' + browseState.company.id);
-    content = `<div class="cards">${types.map((t) =>
+    const types = await getTypes(browseState.company.id);
+    content = types.length ? `<div class="cards">${types.map((t) =>
       `<button class="card" data-type='${h(JSON.stringify(t))}' style="cursor:pointer;text-align:right">
-        <div style="font-size:17px;font-weight:700">${h(t.name)}</div></button>`).join('')}</div>`;
+        <div style="font-size:17px;font-weight:700">${h(t.name)}</div></button>`).join('')}</div>`
+      : `<div class="empty">אין סוגי פריטים תחת חברה זו עדיין.</div>`;
+    // טעינה מקדימה ברקע של המוצרים לכל סוג פריט
+    types.forEach((t) => getProducts(t.id).catch(() => {}));
   } else {
-    const products = await api('/products?item_type_id=' + browseState.itemType.id);
+    const products = await getProducts(browseState.itemType.id);
     content = products.length ? `<div class="table-wrap"><table>
       <thead><tr><th>פריט</th><th>זמין במלאי</th><th>כמות לבקשה</th><th></th></tr></thead><tbody>
       ${products.map((p) => {
@@ -316,6 +341,9 @@ async function drawBrowse() {
         </tr>`;
       }).join('')}</tbody></table></div>`
       : `<div class="empty">אין מוצרים תחת סוג זה עדיין.</div>`;
+  }
+  } catch (e) {
+    content = `<div class="empty">שגיאה בטעינה: ${h(e.message)}</div>`;
   }
 
   body.innerHTML = crumbs + content + cartBar();
