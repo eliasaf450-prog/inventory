@@ -155,11 +155,21 @@ export function initSchema() {
     UNIQUE(name, employee_no)
   );
 
+  -- התכתבות מהירה המשויכת לבקשה (צ'אט בין המזמין למנהל)
+  CREATE TABLE IF NOT EXISTS messages (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    requisition_id INTEGER NOT NULL REFERENCES requisitions(id) ON DELETE CASCADE,
+    user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    body           TEXT NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
   CREATE INDEX IF NOT EXISTS idx_item_types_company ON item_types(company_id);
   CREATE INDEX IF NOT EXISTS idx_products_type ON products(item_type_id);
   CREATE INDEX IF NOT EXISTS idx_req_items_req ON requisition_items(requisition_id);
   CREATE INDEX IF NOT EXISTS idx_po_items_po ON purchase_order_items(purchase_order_id);
   CREATE INDEX IF NOT EXISTS idx_employees_site ON employees(site_id);
+  CREATE INDEX IF NOT EXISTS idx_messages_req ON messages(requisition_id);
   `);
 
   migrate();
@@ -173,6 +183,9 @@ function migrate() {
   }
   if (!cols.includes('employee_id')) {
     db.exec('ALTER TABLE requisitions ADD COLUMN employee_id INTEGER REFERENCES employees(id)');
+  }
+  if (!cols.includes('admin_note')) {
+    db.exec('ALTER TABLE requisitions ADD COLUMN admin_note TEXT');
   }
 }
 

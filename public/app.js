@@ -39,6 +39,21 @@ function modal(html) {
 function closeModal() { $('#modal-root').innerHTML = ''; }
 window.closeModal = closeModal;
 
+// ייצוא טבלה לקובץ שנפתח באקסל (CSV עם BOM לתמיכה בעברית)
+function downloadCsv(filename, rows) {
+  const esc = (v) => {
+    const s = String(v ?? '');
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const csv = '﻿' + rows.map((r) => r.map(esc).join(',')).join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 const GENDER_HE = { men: 'גברים', women: 'נשים', '': '—', null: '—' };
 function productLabel(p) {
   const parts = [p.item_type_name];
@@ -146,12 +161,11 @@ async function doRegister() {
    ================================================================ */
 const NAV = [
   { id: 'dashboard', label: 'לוח בקרה', icon: '📊', roles: ['admin', 'user'] },
-  { id: 'browse', label: 'בקשת ביגוד', icon: '🛒', roles: ['admin', 'user'] },
+  { id: 'browse', label: 'בקשת ביגוד', icon: '🛒', roles: ['user'] },
   { id: 'requisitions', label: 'ההזמנות שלי', icon: '📋', roles: ['user'] },
   { id: 'requisitions', label: 'אישור הזמנות', icon: '📋', roles: ['admin'], adminLabel: true },
   { id: 'inventory', label: 'ניהול מלאי', icon: '📦', roles: ['admin'] },
   { id: 'directory', label: 'אתרים ועובדים', icon: '🏢', roles: ['admin'] },
-  { id: 'shortages', label: 'חוסרים להשלמה', icon: '⚠️', roles: ['admin', 'user'] },
   { id: 'reorder', label: 'הזמנות רכש', icon: '🚚', roles: ['admin'] },
   { id: 'users', label: 'ניהול משתמשים', icon: '👥', roles: ['admin'] },
 ];
@@ -191,7 +205,6 @@ function navBadge(viewId) {
   let n = 0;
   if (viewId === 'requisitions') n = state.user.role === 'admin' ? a.pendingRequisitions : a.myTasks;
   if (viewId === 'reorder') n = (a.pendingPurchaseOrders || 0) + (a.overdueOrders ? a.overdueOrders.length : 0);
-  if (viewId === 'shortages') n = a.lowStock ? a.lowStock.length : 0;
   if (viewId === 'users') n = state.pendingUsers || 0;
   return n ? `<span class="badge">${n}</span>` : '';
 }
@@ -220,7 +233,7 @@ async function refreshAlerts() {
 function renderView() {
   const views = {
     dashboard: viewDashboard, browse: viewBrowse, requisitions: viewRequisitions,
-    inventory: viewInventory, directory: viewDirectory, shortages: viewShortages,
+    inventory: viewInventory, directory: viewDirectory,
     reorder: viewReorder, users: viewUsers,
   };
   (views[state.view] || viewDashboard)();
@@ -231,30 +244,68 @@ function renderView() {
    ================================================================ */
 async function viewDashboard() {
   const main = $('#main');
-  main.innerHTML = `<h1 class="page-title">לוח בקרה</h1><p class="page-sub">סקירה כללית והתראות</p><div id="dash"></div>`;
-  const [d, alerts] = await Promise.all([api('/dashboard'), api('/alerts')]);
+  const isAdmin = state.user.role === 'admin';
+  main.innerHTML = `<h1 class="page-title">לוח בקרה</h1><p class="page-sub">סקירה כללית, חברות ניהול ומשימות פתוחות</p>
+    <div id="dash"><div class="loading"><span class="spinner"></span> טוען…</div></div>`;
+  const calls = [api('/dashboard'), api('/alerts'), api('/item-types')];
+  if (isAdmin) calls.push(api('/requisitions'));
+  const [d, alerts, types, reqs] = await Promise.all(calls);
   state.alerts = alerts;
+  const typesByCompany = {};
+  types.forEach((t) => { (typesByCompany[t.company_id] = typesByCompany[t.company_id] || []).push(t); });
+
   const stat = (num, lbl, cls = '') => `<div class="card stat ${cls}"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`;
   let html = `<div class="cards">
     ${stat(d.companies, 'חברות ניהול')}
-    ${stat(d.products, 'סוגי מוצרים')}
+    ${stat(d.products, 'מק"טים')}
     ${stat(d.totalUnits, 'יחידות במלאי', 'ok')}
     ${stat(d.lowStock, 'מתחת למינימום', d.lowStock ? 'danger' : 'ok')}
-    ${stat(d.openShortages, 'חוסרים פתוחים', d.openShortages ? 'warn' : 'ok')}
     ${stat(d.openPurchaseOrders, 'הזמנות רכש פתוחות', 'warn')}
-    ${state.user.role === 'admin' ? stat(d.pendingUsers, 'משתמשים ממתינים', d.pendingUsers ? 'warn' : '') : ''}
+    ${isAdmin ? stat(d.pendingUsers, 'משתמשים ממתינים', d.pendingUsers ? 'warn' : '') : ''}
   </div>`;
 
+  // משימות פתוחות (מנהל) – בקשות שממתינות לאישורי
+  if (isAdmin) {
+    const pending = (reqs || []).filter((r) => r.status === 'pending');
+    html += `<div class="section" style="margin-top:24px"><h3>📋 משימות פתוחות – בקשות לאישורך (${pending.length})</h3>`;
+    html += pending.length ? pending.slice(0, 8).map((r) => {
+      const units = (r.items || []).reduce((s, i) => s + i.quantity, 0);
+      const who = [r.username, r.employee_name, r.site_name].filter(Boolean).join(' · ');
+      return `<div class="card" style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+        <span style="font-size:20px">🔔</span>
+        <span style="flex:1">בקשה #${r.id} · ${h(who)} · ${units} פריטים</span>
+        <button class="btn sm primary" data-goto="requisitions">לאישור</button></div>`;
+    }).join('') + (pending.length > 8 ? `<div class="muted">ועוד ${pending.length - 8}…</div>` : '')
+      : `<div class="empty">אין בקשות הממתינות לאישור 🎉</div>`;
+    html += `</div>`;
+  }
+
+  // חברות ניהול – לחיצה למעבר, כולל קפיצה לכל תת-קטגוריה
+  if (isAdmin) {
+    html += `<div class="section" style="margin-top:24px"><h3>🏢 חברות ניהול (${(d.companiesBreakdown || []).length})</h3>`;
+    html += (d.companiesBreakdown || []).length ? `<div class="cards">${d.companiesBreakdown.map((c) => {
+      const chips = (typesByCompany[c.id] || []).map((t) =>
+        `<button class="chip" data-cat='${h(JSON.stringify({ company: c.id }))}' style="cursor:pointer">${h(t.name)}</button>`).join(' ');
+      return `<div class="card">
+        <div style="display:flex;align-items:center;gap:8px">
+          <div style="font-weight:700;font-size:16px;flex:1">🏢 ${h(c.name)}</div>
+          <button class="btn sm primary" data-company-go="${c.id}">פתיחה</button>
+        </div>
+        <div class="muted" style="margin:6px 0">${c.item_type_count} סוגים · ${c.product_count} מק"טים · <b>${c.total_units}</b> יחידות במלאי</div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">${chips || '<span class="muted">אין סוגי פריטים</span>'}</div>
+      </div>`;
+    }).join('')}</div>` : `<div class="empty">אין חברות ניהול. הוסיפו ב"ניהול מלאי".</div>`;
+    html += `</div>`;
+  }
+
   // התראות
-  html += `<div class="section" style="margin-top:28px"><h3>התראות</h3>`;
+  html += `<div class="section" style="margin-top:24px"><h3>התראות</h3>`;
   const blocks = [];
-  if (alerts.pendingRequisitions && state.user.role === 'admin')
-    blocks.push(alertRow('🔔', `${alerts.pendingRequisitions} בקשות ביגוד ממתינות לאישורך`, 'requisitions'));
-  if (alerts.myTasks)
+  if (alerts.myTasks && !isAdmin)
     blocks.push(alertRow('✅', `${alerts.myTasks} בקשות אושרו וממתינות לאישור לקיחה`, 'requisitions'));
   if (alerts.lowStock && alerts.lowStock.length)
-    blocks.push(alertRow('⚠️', `${alerts.lowStock.length} מוצרים הגיעו למינימום – מומלץ לבצע הזמנה`, 'reorder'));
-  if (alerts.pendingPurchaseOrders && state.user.role === 'admin')
+    blocks.push(alertRow('⚠️', `${alerts.lowStock.length} מוצרים הגיעו למינימום – מומלץ לבצע הזמנת רכש`, 'reorder'));
+  if (alerts.pendingPurchaseOrders && isAdmin)
     blocks.push(alertRow('📝', `${alerts.pendingPurchaseOrders} הזמנות רכש ממתינות לאישור ביצוע`, 'reorder'));
   if (alerts.overdueOrders && alerts.overdueOrders.length)
     blocks.push(alertRow('⏰', `${alerts.overdueOrders.length} הזמנות רכש שיצאו ועבר זמן ההתראה – יש לבדוק סטטוס`, 'reorder'));
@@ -262,6 +313,12 @@ async function viewDashboard() {
   html += `</div>`;
   $('#dash').innerHTML = html;
   document.querySelectorAll('[data-goto]').forEach((b) => b.addEventListener('click', () => navigate(b.dataset.goto)));
+  document.querySelectorAll('[data-company-go]').forEach((b) => b.addEventListener('click', () => {
+    invState.company = String(b.dataset.companyGo); navigate('inventory');
+  }));
+  document.querySelectorAll('[data-cat]').forEach((b) => b.addEventListener('click', () => {
+    invState.company = String(JSON.parse(b.dataset.cat).company); navigate('inventory');
+  }));
 }
 function alertRow(icon, text, goto) {
   return `<div class="card" style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
@@ -446,44 +503,90 @@ async function viewRequisitions() {
 function reqCard(r, isAdmin) {
   const items = (r.items || []).map((i) =>
     `<tr><td>${h(productLabel(i))}</td><td>${i.quantity}</td><td class="${i.stock >= i.quantity ? 'qty-ok' : 'qty-low'}">${i.stock} במלאי</td></tr>`).join('');
+  const totalUnits = (r.items || []).reduce((s, i) => s + i.quantity, 0);
   let actions = '';
   if (r.status === 'pending' && isAdmin)
     actions = `<button class="btn sm green" data-approve="${r.id}">אישור הזמנה</button>
                <button class="btn sm red" data-reject="${r.id}">דחייה</button>`;
   if (r.status === 'approved' && (r.user_id === state.user.id || isAdmin))
     actions = `<button class="btn sm primary" data-collect="${r.id}">אישור לקיחת הביגוד</button>`;
+  actions += ` <button class="btn sm" data-chat="${r.id}">💬 צ'אט</button>`;
   return `<div class="card section" style="margin-bottom:16px">
     <div class="toolbar" style="margin-bottom:10px">
       <b>הזמנה #${r.id}</b> ${statusTag(r.status)}
-      <span class="muted">מאת ${h(r.username)} · ${h(r.created_at)}</span>
+      <span class="muted">מאת ${h(r.username)} · ${h(r.created_at)} · ${totalUnits} פריטים</span>
       <div class="spacer"></div>${actions}
     </div>
     ${(r.site_name || r.employee_name) ? `<div class="muted" style="margin-bottom:6px">
       ${r.employee_name ? '👤 ' + h(r.employee_name) : ''}${r.site_name ? ' · 🏢 ' + h(r.site_name) : ''}</div>` : ''}
-    ${r.note ? `<div class="muted" style="margin-bottom:8px">הערה: ${h(r.note)}</div>` : ''}
+    ${r.note ? `<div class="muted" style="margin-bottom:8px">הערת המזמין: ${h(r.note)}</div>` : ''}
     <div class="table-wrap"><table><thead><tr><th>פריט</th><th>כמות</th><th>מלאי</th></tr></thead>
       <tbody>${items}</tbody></table></div>
-    ${r.status === 'collected' ? `<div class="muted" style="margin-top:8px">✔ נלקח ב-${h(r.collected_at)} · המלאי עודכן ונרשמו חוסרים להשלמה</div>` : ''}
+    ${r.admin_note ? `<div class="card" style="margin-top:8px;background:#eef6ff"><b>הערת מנהל:</b> ${h(r.admin_note)}</div>` : ''}
+    ${r.status === 'rejected' && r.rejected_reason ? `<div class="card" style="margin-top:8px;background:#fff0f0"><b>סיבת דחייה:</b> ${h(r.rejected_reason)}</div>` : ''}
+    ${r.status === 'collected' ? `<div class="muted" style="margin-top:8px">✔ נלקח ב-${h(r.collected_at)} · המלאי עודכן</div>` : ''}
   </div>`;
 }
 function bindReqActions() {
-  document.querySelectorAll('[data-approve]').forEach((b) => b.addEventListener('click', async () => {
-    try { await api(`/requisitions/${b.dataset.approve}/approve`, { method: 'POST' });
-      toast('ההזמנה אושרה', 'success'); await refreshAlerts(); viewRequisitions(); }
-    catch (e) { toast(e.message, 'error'); }
-  }));
-  document.querySelectorAll('[data-reject]').forEach((b) => b.addEventListener('click', async () => {
-    const reason = prompt('סיבת דחייה (אופציונלי):') || '';
-    try { await api(`/requisitions/${b.dataset.reject}/reject`, { method: 'POST', body: { reason } });
-      toast('ההזמנה נדחתה'); await refreshAlerts(); viewRequisitions(); }
-    catch (e) { toast(e.message, 'error'); }
-  }));
+  document.querySelectorAll('[data-approve]').forEach((b) => b.addEventListener('click', () => decisionModal(b.dataset.approve, 'approve')));
+  document.querySelectorAll('[data-reject]').forEach((b) => b.addEventListener('click', () => decisionModal(b.dataset.reject, 'reject')));
   document.querySelectorAll('[data-collect]').forEach((b) => b.addEventListener('click', async () => {
     if (!confirm('לאשר לקיחת הביגוד בפועל? פעולה זו תוריד את הכמויות מהמלאי.')) return;
     try { await api(`/requisitions/${b.dataset.collect}/collect`, { method: 'POST' });
       toast('הלקיחה אושרה והמלאי עודכן', 'success'); await refreshAlerts(); viewRequisitions(); }
     catch (e) { toast(e.message, 'error'); }
   }));
+  document.querySelectorAll('[data-chat]').forEach((b) => b.addEventListener('click', () => chatModal(b.dataset.chat)));
+}
+// אישור/דחייה עם הערה שתוצג למשתמש
+function decisionModal(id, kind) {
+  const approve = kind === 'approve';
+  modal(`<h2>${approve ? 'אישור הזמנה' : 'דחיית הזמנה'} #${id}</h2>
+    <label>הערה למשתמש ${approve ? '(אופציונלי)' : '(סיבת הדחייה)'}</label>
+    <textarea id="dec-note" rows="3" placeholder="${approve ? 'לדוגמה: ייאסף ממחסן מרכזי' : 'לדוגמה: הפריט אזל, נא לבחור חלופה'}"></textarea>
+    <div class="modal-actions">
+      <button class="btn ${approve ? 'green' : 'red'}" id="dec-go">${approve ? 'אישור' : 'דחייה'}</button>
+      <button class="btn" onclick="closeModal()">ביטול</button></div>`);
+  $('#dec-go').addEventListener('click', async () => {
+    const note = $('#dec-note').value.trim();
+    try {
+      if (approve) await api(`/requisitions/${id}/approve`, { method: 'POST', body: { note } });
+      else await api(`/requisitions/${id}/reject`, { method: 'POST', body: { reason: note } });
+      closeModal(); toast(approve ? 'ההזמנה אושרה' : 'ההזמנה נדחתה', approve ? 'success' : 'info');
+      await refreshAlerts(); viewRequisitions();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+}
+// צ'אט / התכתבות מהירה על בקשה
+async function chatModal(id) {
+  const render = async () => {
+    const msgs = await api(`/requisitions/${id}/messages`);
+    const thread = msgs.length ? msgs.map((m) => {
+      const mine = m.user_id === state.user.id;
+      return `<div style="margin-bottom:8px;text-align:${mine ? 'left' : 'right'}">
+        <div style="display:inline-block;max-width:80%;background:${mine ? '#dcf2ff' : '#f0f0f0'};padding:8px 12px;border-radius:10px">
+          <div style="font-size:12px;color:#666">${h(m.username)}${m.role === 'admin' ? ' (מנהל)' : ''} · ${h(m.created_at)}</div>
+          <div>${h(m.body)}</div></div></div>`;
+    }).join('') : `<div class="empty">אין הודעות עדיין. כתבו את ההודעה הראשונה.</div>`;
+    $('#chat-thread').innerHTML = thread;
+    const t = $('#chat-thread'); t.scrollTop = t.scrollHeight;
+  };
+  modal(`<h2>💬 התכתבות – בקשה #${id}</h2>
+    <div id="chat-thread" style="max-height:320px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px"></div>
+    <div style="display:flex;gap:8px">
+      <input id="chat-input" placeholder="הקלידו הודעה…" style="flex:1">
+      <button class="btn primary" id="chat-send">שליחה</button>
+    </div>
+    <div class="modal-actions"><button class="btn" onclick="closeModal()">סגירה</button></div>`);
+  const send = async () => {
+    const body = $('#chat-input').value.trim();
+    if (!body) return;
+    try { await api(`/requisitions/${id}/messages`, { method: 'POST', body: { body } });
+      $('#chat-input').value = ''; await render(); } catch (e) { toast(e.message, 'error'); }
+  };
+  $('#chat-send').addEventListener('click', send);
+  $('#chat-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+  await render();
 }
 
 /* ================================================================
@@ -547,6 +650,7 @@ async function drawInventory() {
         <td class="${low ? 'qty-low' : 'qty-ok'}">${p.quantity}</td>
         <td>${p.target_quantity}</td>
         <td>${p.min_quantity}</td>
+        <td>${restockCell(p)}</td>
         <td class="btn-row">
           <button class="btn sm" data-adj="${p.id}" data-d="1">+1</button>
           <button class="btn sm" data-adj="${p.id}" data-d="-1">−1</button>
@@ -554,16 +658,18 @@ async function drawInventory() {
           <button class="btn sm red" data-del-prod="${p.id}">🗑</button>
         </td></tr>`;
     }).join('');
+    const typeUnits = (byType[t.id] || []).reduce((s, p) => s + p.quantity, 0);
     return `<div class="section">
       <div class="toolbar" style="margin-bottom:8px">
         <h3 style="margin:0">${h(t.name)}</h3>
         <span class="chip">${schemeLabel(t.size_scheme)}</span>
+        <span class="muted">סה"כ ${typeUnits} יח' במלאי</span>
         <div class="spacer"></div>
         <button class="btn sm primary" data-add-prod='${h(JSON.stringify(t))}'>➕ מוצר</button>
         <button class="btn sm red" data-del-type="${t.id}">מחיקת סוג</button>
       </div>
       ${rows ? `<div class="table-wrap"><table>
-        <thead><tr><th>מין</th><th>מידה</th><th>יצרן</th><th>במלאי</th><th>יעד</th><th>מינימום</th><th>פעולות</th></tr></thead>
+        <thead><tr><th>מין</th><th>מידה</th><th>יצרן</th><th>במלאי</th><th>יעד</th><th>מינימום</th><th>חידוש מלאי</th><th>פעולות</th></tr></thead>
         <tbody>${rows}</tbody></table></div>` : `<div class="empty">אין מוצרים. הוסיפו מוצר חדש.</div>`}
     </div>`;
   }).join('');
@@ -582,9 +688,19 @@ async function drawInventory() {
     await api('/item-types/' + b.dataset.delType, { method: 'DELETE' }); toast('נמחק'); drawInventory();
   }));
   body.querySelectorAll('[data-add-prod]').forEach((b) => b.addEventListener('click', () => addProductModal(JSON.parse(b.dataset.addProd))));
+  body.querySelectorAll('[data-goto-reorder]').forEach((b) => b.addEventListener('click', () => navigate('reorder')));
 }
 function schemeLabel(scheme) {
   return (state.schemes && state.schemes.schemes[scheme] && state.schemes.schemes[scheme].label) || scheme;
+}
+// תא "חידוש מלאי" – מצב הזמנת הרכש הפתוחה למוצר, אם קיימת
+function restockCell(p) {
+  if (!p.restock_status) return '<span class="muted">—</span>';
+  let txt = statusTag(p.restock_status);
+  if (p.restock_qty) txt += ` <span class="muted">(${p.restock_qty})</span>`;
+  if (p.restock_sent_at) txt += `<div class="muted" style="font-size:12px">יצא: ${h(p.restock_sent_at)}</div>`;
+  txt += ` <button class="btn sm" data-goto-reorder="1">מעקב</button>`;
+  return txt;
 }
 function addCompanyModal() {
   modal(`<h2>חברת ניהול חדשה</h2>
@@ -731,15 +847,19 @@ async function viewDirectory() {
 }
 async function drawDirectory() {
   const [sites, emps] = await Promise.all([api('/sites'), api('/employees')]);
+  const siteOptions = (selected) => `<option value="">— ללא אתר —</option>` +
+    sites.map((s) => `<option value="${s.id}" ${String(selected) === String(s.id) ? 'selected' : ''}>${h(s.name)}</option>`).join('');
   $('#sites-body').innerHTML = sites.length ? `<div class="table-wrap"><table>
     <thead><tr><th>שם אתר</th><th>קוד</th><th>עובדים</th><th></th></tr></thead>
     <tbody>${sites.map((s) => `<tr><td>${h(s.name)}</td><td>${h(s.code || '—')}</td>
       <td>${s.employee_count}</td><td><button class="btn sm red" data-del-site="${s.id}">🗑</button></td></tr>`).join('')}
     </tbody></table></div>` : `<div class="empty">אין אתרים. הוסיפו ידנית או ייבאו מאקסל.</div>`;
-  $('#emps-body').innerHTML = emps.length ? `<div class="table-wrap"><table>
-    <thead><tr><th>שם עובד</th><th>מספר עובד</th><th>אתר</th><th></th></tr></thead>
+  $('#emps-body').innerHTML = emps.length ? `<div class="muted" style="margin-bottom:8px">לשיוך עובד לאתר – בחרו אתר מהרשימה שליד שמו (נשמר אוטומטית).</div>
+    <div class="table-wrap"><table>
+    <thead><tr><th>שם עובד</th><th>מספר עובד</th><th>שיוך לאתר</th><th></th></tr></thead>
     <tbody>${emps.map((e) => `<tr><td>${h(e.name)}</td><td>${h(e.employee_no || '—')}</td>
-      <td>${h(e.site_name || '—')}</td><td><button class="btn sm red" data-del-emp="${e.id}">🗑</button></td></tr>`).join('')}
+      <td><select class="emp-site" data-emp="${e.id}">${siteOptions(e.site_id)}</select></td>
+      <td><button class="btn sm red" data-del-emp="${e.id}">🗑</button></td></tr>`).join('')}
     </tbody></table></div>` : `<div class="empty">אין עובדים. הוסיפו ידנית או ייבאו מאקסל.</div>`;
   document.querySelectorAll('[data-del-site]').forEach((b) => b.addEventListener('click', async () => {
     if (!confirm('למחוק אתר זה?')) return;
@@ -748,6 +868,10 @@ async function drawDirectory() {
   document.querySelectorAll('[data-del-emp]').forEach((b) => b.addEventListener('click', async () => {
     if (!confirm('למחוק עובד זה?')) return;
     await api('/employees/' + b.dataset.delEmp, { method: 'DELETE' }); toast('נמחק'); drawDirectory();
+  }));
+  document.querySelectorAll('.emp-site').forEach((sel) => sel.addEventListener('change', async () => {
+    try { await api('/employees/' + sel.dataset.emp, { method: 'PATCH', body: { site_id: sel.value || null } });
+      toast('השיוך עודכן', 'success'); drawDirectory(); } catch (e) { toast(e.message, 'error'); }
   }));
 }
 function addSiteModal() {
@@ -859,41 +983,6 @@ async function doImport(kind, rows) {
 }
 
 /* ================================================================
-   חוסרים להשלמה
-   ================================================================ */
-async function viewShortages() {
-  const main = $('#main');
-  main.innerHTML = `<h1 class="page-title">חוסרים להשלמה</h1>
-    <p class="page-sub">פריטים שנלקחו מהמלאי וממתינים להשלמה, ומוצרים שהגיעו למינימום</p>
-    <div id="sh-body"></div>`;
-  const [shortages, low] = await Promise.all([
-    api('/shortages'),
-    state.user.role === 'admin' ? api('/reorder-suggestions') : Promise.resolve([]),
-  ]);
-  let html = '';
-  html += `<div class="section"><h3>מתחת/בדיוק על המינימום (${low.length})</h3>`;
-  html += low.length ? `<div class="table-wrap"><table>
-    <thead><tr><th>חברה</th><th>פריט</th><th>במלאי</th><th>מינימום</th><th>יעד</th><th>מומלץ להזמין</th></tr></thead>
-    <tbody>${low.map((p) => `<tr><td>${h(p.company_name)}</td><td>${h(productLabel(p))}</td>
-      <td class="qty-low">${p.quantity}</td><td>${p.min_quantity}</td><td>${p.target_quantity}</td>
-      <td><b>${p.suggested}</b></td></tr>`).join('')}</tbody></table></div>
-    <div style="margin-top:10px"><button class="btn primary" id="go-reorder">מעבר ליצירת הזמנת רכש</button></div>`
-    : `<div class="empty">אין מוצרים מתחת למינימום 🎉</div>`;
-  html += `</div>`;
-
-  html += `<div class="section"><h3>חוסרים שנרשמו מלקיחות (${shortages.length})</h3>`;
-  html += shortages.length ? `<div class="table-wrap"><table>
-    <thead><tr><th>חברה</th><th>פריט</th><th>כמות חסרה</th><th>מקור</th><th>תאריך</th></tr></thead>
-    <tbody>${shortages.map((s) => `<tr><td>${h(s.company_name)}</td><td>${h(productLabel(s))}</td>
-      <td class="qty-low">${s.quantity}</td><td>${h(s.source || '')}</td><td>${h(s.created_at)}</td></tr>`).join('')}
-    </tbody></table></div>`
-    : `<div class="empty">אין חוסרים פתוחים.</div>`;
-  html += `</div>`;
-  $('#sh-body').innerHTML = html;
-  const g = $('#go-reorder'); if (g) g.addEventListener('click', () => navigate('reorder'));
-}
-
-/* ================================================================
    הזמנות רכש (מנהל) – יצירה, אישור, שליחה, קבלה
    ================================================================ */
 async function viewReorder() {
@@ -928,6 +1017,7 @@ function poCard(po) {
   }
   if (!['received', 'cancelled'].includes(po.status))
     actions += ` <button class="btn sm red" data-po-cancel="${po.id}">ביטול</button>`;
+  actions += ` <button class="btn sm" data-po-export='${h(JSON.stringify(po))}'>⬇ אקסל</button>`;
   return `<div class="card section" style="margin-bottom:16px">
     <div class="toolbar" style="margin-bottom:8px">
       <b>הזמנת רכש #${po.id}</b> ${statusTag(po.status)}
@@ -960,20 +1050,41 @@ function bindPoActions() {
     toast('בוטל'); viewReorder();
   }));
   document.querySelectorAll('[data-po-receive]').forEach((b) => b.addEventListener('click', () => receivePoModal(JSON.parse(b.dataset.poReceive))));
+  document.querySelectorAll('[data-po-export]').forEach((b) => b.addEventListener('click', () => exportPo(JSON.parse(b.dataset.poExport))));
+}
+// ייצוא הזמנת רכש לקובץ אקסל (CSV)
+function exportPo(po) {
+  const rows = [
+    ['הזמנת רכש', '#' + po.id, po.po_number || ''],
+    ['סטטוס', po.status, ''],
+    ['נוצר', po.created_at, ''],
+    [],
+    ['חברה', 'פריט', 'הוזמן', 'התקבל', 'חסר'],
+  ];
+  po.items.forEach((i) => rows.push([
+    i.company_name, productLabel(i), i.quantity_ordered, i.quantity_received,
+    Math.max(0, i.quantity_ordered - i.quantity_received),
+  ]));
+  downloadCsv(`purchase-order-${po.id}.csv`, rows);
+  toast('הקובץ ירד – ניתן לפתוח באקסל', 'success');
 }
 async function newPurchaseOrderModal() {
-  const sug = await api('/reorder-suggestions');
-  if (!sug.length) { toast('אין מוצרים מתחת למינימום כרגע'); return; }
+  const [products, sug] = await Promise.all([api('/products'), api('/reorder-suggestions')]);
+  if (!products.length) { toast('אין מוצרים במערכת. הוסיפו מוצרים ב"ניהול מלאי" תחילה.', 'error'); return; }
+  const prodById = {}; products.forEach((p) => { prodById[p.id] = p; });
+  const lines = []; // {product_id, qty}
+  const prodOpts = products.map((p) =>
+    `<option value="${p.id}">${h(p.company_name)} · ${h(productLabel(p))} (במלאי ${p.quantity})</option>`).join('');
   modal(`<h2>הזמנת רכש חדשה</h2>
-    <div class="muted" style="margin-bottom:10px">בחרו פריטים וכמות. ברירת המחדל מחושבת לפי היעד והמינימום.</div>
-    <div class="table-wrap"><table><thead><tr><th>בחירה</th><th>פריט</th><th>במלאי</th><th>להזמין</th></tr></thead>
-      <tbody>${sug.map((p) => `<tr>
-        <td><input type="checkbox" class="po-chk" data-id="${p.id}" checked></td>
-        <td>${h(p.company_name)} · ${h(productLabel(p))}</td>
-        <td class="qty-low">${p.quantity}</td>
-        <td><input type="number" class="po-qty inline-num" data-id="${p.id}" value="${p.suggested}" min="1"></td>
-      </tr>`).join('')}</tbody></table></div>
-    <div class="field-row">
+    <div class="muted" style="margin-bottom:10px">בנו הזמנה מכל מוצר שתרצו. ניתן גם להוסיף בלחיצה את כל המוצרים מתחת למינימום.</div>
+    <div class="field-row" style="align-items:flex-end">
+      <div style="flex:2"><label>מוצר</label><select id="po-prod">${prodOpts}</select></div>
+      <div><label>כמות</label><input id="po-add-qty" type="number" value="1" min="1" class="inline-num"></div>
+      <div><button class="btn primary" id="po-add-line">➕ הוסף</button></div>
+    </div>
+    ${sug.length ? `<button class="btn sm" id="po-add-sug" style="margin-bottom:10px">➕ הוסף את כל החוסרים (${sug.length})</button>` : ''}
+    <div id="po-lines"></div>
+    <div class="field-row" style="margin-top:10px">
       <div><label>הערה</label><input id="po-note"></div>
       <div><label>התראת בדיקת סטטוס (ימים)</label>
         <select id="po-reminder"><option value="7">כל שבוע (7)</option><option value="14">כל שבועיים (14)</option>
@@ -981,20 +1092,37 @@ async function newPurchaseOrderModal() {
     </div>
     <div class="modal-actions"><button class="btn primary" id="po-create">יצירת הזמנה לאישור</button>
     <button class="btn" onclick="closeModal()">ביטול</button></div>`);
+  const renderLines = () => {
+    $('#po-lines').innerHTML = lines.length ? `<div class="table-wrap"><table>
+      <thead><tr><th>פריט</th><th>כמות</th><th></th></tr></thead><tbody>
+      ${lines.map((l, i) => `<tr><td>${h(prodById[l.product_id].company_name)} · ${h(productLabel(prodById[l.product_id]))}</td>
+        <td>${l.qty}</td><td><button class="btn sm red" data-rm-line="${i}">הסר</button></td></tr>`).join('')}
+      </tbody></table></div>` : `<div class="empty">טרם נוספו פריטים להזמנה.</div>`;
+    document.querySelectorAll('[data-rm-line]').forEach((b) => b.addEventListener('click', () => {
+      lines.splice(Number(b.dataset.rmLine), 1); renderLines();
+    }));
+  };
+  const addLine = (productId, qty) => {
+    const existing = lines.find((l) => l.product_id === productId);
+    if (existing) existing.qty += qty; else lines.push({ product_id: productId, qty });
+  };
+  $('#po-add-line').addEventListener('click', () => {
+    const pid = Number($('#po-prod').value);
+    const qty = Number($('#po-add-qty').value) || 0;
+    if (qty <= 0) return toast('כמות לא תקינה', 'error');
+    addLine(pid, qty); renderLines();
+  });
+  const sugBtn = $('#po-add-sug');
+  if (sugBtn) sugBtn.addEventListener('click', () => { sug.forEach((p) => addLine(p.id, p.suggested)); renderLines(); });
   $('#po-create').addEventListener('click', async () => {
-    const items = [];
-    document.querySelectorAll('.po-chk').forEach((chk) => {
-      if (chk.checked) {
-        const qty = Number(document.querySelector(`.po-qty[data-id="${chk.dataset.id}"]`).value) || 0;
-        if (qty > 0) items.push({ product_id: Number(chk.dataset.id), quantity_ordered: qty });
-      }
-    });
-    if (!items.length) return toast('בחרו לפחות פריט אחד', 'error');
+    if (!lines.length) return toast('הוסיפו לפחות פריט אחד', 'error');
+    const items = lines.map((l) => ({ product_id: l.product_id, quantity_ordered: l.qty }));
     try { await api('/purchase-orders', { method: 'POST', body: {
       items, note: $('#po-note').value, reminder_days: Number($('#po-reminder').value) } });
       closeModal(); toast('ההזמנה נוצרה וממתינה לאישור ביצוע', 'success'); await refreshAlerts(); viewReorder(); }
     catch (e) { toast(e.message, 'error'); }
   });
+  renderLines();
 }
 function receivePoModal(po) {
   modal(`<h2>קבלת הזמנת רכש #${po.id}</h2>

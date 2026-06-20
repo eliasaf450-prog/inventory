@@ -239,7 +239,16 @@ const api = {
     const itemTypeId = ctx.query.get('item_type_id');
     const companyId = ctx.query.get('company_id');
     let sql = `
-      SELECT p.*, t.name AS item_type_name, t.size_scheme, t.company_id, c.name AS company_name
+      SELECT p.*, t.name AS item_type_name, t.size_scheme, t.company_id, c.name AS company_name,
+        (SELECT po.status FROM purchase_order_items poi JOIN purchase_orders po ON po.id = poi.purchase_order_id
+           WHERE poi.product_id = p.id AND po.status NOT IN ('received','cancelled')
+           ORDER BY po.created_at DESC LIMIT 1) AS restock_status,
+        (SELECT po.sent_at FROM purchase_order_items poi JOIN purchase_orders po ON po.id = poi.purchase_order_id
+           WHERE poi.product_id = p.id AND po.status NOT IN ('received','cancelled')
+           ORDER BY po.created_at DESC LIMIT 1) AS restock_sent_at,
+        (SELECT poi.quantity_ordered FROM purchase_order_items poi JOIN purchase_orders po ON po.id = poi.purchase_order_id
+           WHERE poi.product_id = p.id AND po.status NOT IN ('received','cancelled')
+           ORDER BY po.created_at DESC LIMIT 1) AS restock_qty
       FROM products p
       JOIN item_types t ON t.id = p.item_type_id
       JOIN companies c ON c.id = t.company_id`;
@@ -351,8 +360,8 @@ const api = {
     const r = db.prepare('SELECT * FROM requisitions WHERE id = ?').get(ctx.params.id);
     if (!r) return fail(ctx.res, 404, 'בקשה לא קיימת');
     if (r.status !== 'pending') return fail(ctx.res, 400, 'הבקשה אינה ממתינה לאישור');
-    db.prepare("UPDATE requisitions SET status = 'approved', approved_at = datetime('now'), approved_by = ? WHERE id = ?")
-      .run(ctx.user.id, ctx.params.id);
+    db.prepare("UPDATE requisitions SET status = 'approved', approved_at = datetime('now'), approved_by = ?, admin_note = ? WHERE id = ?")
+      .run(ctx.user.id, ctx.body.note || null, ctx.params.id);
     json(ctx.res, 200, { ok: true });
   },
   async rejectRequisition(ctx) {
@@ -385,6 +394,30 @@ const api = {
         .run(r.id);
     });
     json(ctx.res, 200, { ok: true });
+  },
+
+  /* ---------------------- התכתבות מהירה (צ'אט על בקשה) ---------------------- */
+  async listMessages(ctx) {
+    const r = db.prepare('SELECT * FROM requisitions WHERE id = ?').get(ctx.params.id);
+    if (!r) return fail(ctx.res, 404, 'בקשה לא קיימת');
+    if (ctx.user.role !== 'admin' && r.user_id !== ctx.user.id) return fail(ctx.res, 403, 'אין הרשאה');
+    const rows = db
+      .prepare(
+        `SELECT m.*, u.username, u.role FROM messages m JOIN users u ON u.id = m.user_id
+         WHERE m.requisition_id = ? ORDER BY m.created_at`
+      )
+      .all(ctx.params.id);
+    json(ctx.res, 200, rows);
+  },
+  async postMessage(ctx) {
+    const r = db.prepare('SELECT * FROM requisitions WHERE id = ?').get(ctx.params.id);
+    if (!r) return fail(ctx.res, 404, 'בקשה לא קיימת');
+    if (ctx.user.role !== 'admin' && r.user_id !== ctx.user.id) return fail(ctx.res, 403, 'אין הרשאה');
+    const body = String(ctx.body.body || '').trim();
+    if (!body) return fail(ctx.res, 400, 'הודעה ריקה');
+    const info = db.prepare('INSERT INTO messages (requisition_id, user_id, body) VALUES (?, ?, ?)')
+      .run(ctx.params.id, ctx.user.id, body);
+    json(ctx.res, 201, { id: info.lastInsertRowid });
   },
 
   /* ---------------------- חוסרים ---------------------- */
@@ -457,6 +490,19 @@ const api = {
       .prepare('INSERT INTO employees (name, employee_no, site_id) VALUES (?, ?, ?)')
       .run(name, employee_no || null, site_id || null);
     json(ctx.res, 201, { id: info.lastInsertRowid });
+  },
+  async updateEmployee(ctx) {
+    const b = ctx.body;
+    const e = db.prepare('SELECT * FROM employees WHERE id = ?').get(ctx.params.id);
+    if (!e) return fail(ctx.res, 404, 'עובד לא קיים');
+    const sets = [], args = [];
+    if (b.name !== undefined) { sets.push('name = ?'); args.push(String(b.name).trim()); }
+    if (b.employee_no !== undefined) { sets.push('employee_no = ?'); args.push(b.employee_no ? String(b.employee_no).trim() : null); }
+    if (b.site_id !== undefined) { sets.push('site_id = ?'); args.push(b.site_id || null); }
+    if (!sets.length) return json(ctx.res, 200, { ok: true });
+    args.push(ctx.params.id);
+    db.prepare(`UPDATE employees SET ${sets.join(', ')} WHERE id = ?`).run(...args);
+    json(ctx.res, 200, { ok: true });
   },
   async deleteEmployee(ctx) {
     db.prepare('DELETE FROM employees WHERE id = ?').run(ctx.params.id);
@@ -645,6 +691,16 @@ const api = {
       lowStock: db.prepare('SELECT COUNT(*) AS c FROM products WHERE min_quantity > 0 AND quantity <= min_quantity').get().c,
       openPurchaseOrders: db.prepare("SELECT COUNT(*) AS c FROM purchase_orders WHERE status NOT IN ('received','cancelled')").get().c,
     };
+    // פירוט לכל חברת ניהול: סוגי פריטים, מק"טים וסך יחידות במלאי
+    counts.companiesBreakdown = db
+      .prepare(
+        `SELECT c.id, c.name,
+           (SELECT COUNT(*) FROM item_types t WHERE t.company_id = c.id) AS item_type_count,
+           (SELECT COUNT(*) FROM products p JOIN item_types t ON t.id = p.item_type_id WHERE t.company_id = c.id) AS product_count,
+           (SELECT IFNULL(SUM(p.quantity),0) FROM products p JOIN item_types t ON t.id = p.item_type_id WHERE t.company_id = c.id) AS total_units
+         FROM companies c ORDER BY c.name`
+      )
+      .all();
     json(ctx.res, 200, counts);
   },
 };
@@ -756,6 +812,8 @@ route('GET', '/api/requisitions', api.listRequisitions, AUTH);
 route('POST', '/api/requisitions/:id/approve', api.approveRequisition, ADMIN);
 route('POST', '/api/requisitions/:id/reject', api.rejectRequisition, ADMIN);
 route('POST', '/api/requisitions/:id/collect', api.collectRequisition, AUTH);
+route('GET', '/api/requisitions/:id/messages', api.listMessages, AUTH);
+route('POST', '/api/requisitions/:id/messages', api.postMessage, AUTH);
 
 route('GET', '/api/sites', api.listSites, AUTH);
 route('POST', '/api/sites', api.createSite, ADMIN);
@@ -764,6 +822,7 @@ route('POST', '/api/sites/bulk', api.bulkSites, ADMIN);
 
 route('GET', '/api/employees', api.listEmployees, AUTH);
 route('POST', '/api/employees', api.createEmployee, ADMIN);
+route('PATCH', '/api/employees/:id', api.updateEmployee, ADMIN);
 route('DELETE', '/api/employees/:id', api.deleteEmployee, ADMIN);
 route('POST', '/api/employees/bulk', api.bulkEmployees, ADMIN);
 
