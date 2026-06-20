@@ -863,12 +863,16 @@ function serveStatic(req, res) {
       // SPA fallback
       fs.readFile(path.join(PUBLIC_DIR, 'index.html'), (e2, html) => {
         if (e2) return fail(res, 404, 'not found');
-        res.writeHead(200, { 'Content-Type': MIME['.html'] });
+        res.writeHead(200, { 'Content-Type': MIME['.html'], 'Cache-Control': 'no-store' });
         res.end(html);
       });
       return;
     }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(filePath)] || 'application/octet-stream' });
+    // מונע מהדפדפן/פרוקסי לשמור גרסה ישנה של האפליקציה
+    res.writeHead(200, {
+      'Content-Type': MIME[path.extname(filePath)] || 'application/octet-stream',
+      'Cache-Control': 'no-store',
+    });
     res.end(data);
   });
 }
