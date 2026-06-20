@@ -1,0 +1,12 @@
+# החליפו את הדומיין שלכם בשורה הראשונה.
+# Caddy ידאג אוטומטית לתעודת HTTPS חינמית (Let's Encrypt) ולחידושה.
+inventory.example.com {
+    reverse_proxy 127.0.0.1:3000
+
+    # מגביל גודל העלאה (קבצי אקסל/CSV) ל-25MB בהתאם לשרת
+    request_body {
+        max_size 25MB
+    }
+
+    encode gzip
+}

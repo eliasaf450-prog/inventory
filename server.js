@@ -10,6 +10,8 @@ import { parseSpreadsheet } from './src/xlsx.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const PORT = process.env.PORT || 3000;
+// HOST ריק = הקשבה על כל הממשקים; מאחורי reverse proxy מומלץ 127.0.0.1
+const HOST = process.env.HOST || undefined;
 const SESSION_DAYS = 14;
 
 initSchema();
@@ -849,6 +851,6 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`\n  מערכת ניהול מלאי ביגוד פועלת:  http://localhost:${PORT}\n`);
+server.listen(PORT, HOST, () => {
+  console.log(`\n  מערכת ניהול מלאי ביגוד פועלת:  http://${HOST || 'localhost'}:${PORT}\n`);
 });
