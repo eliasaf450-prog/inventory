@@ -2,13 +2,34 @@ import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 import { hashPassword } from './auth.js';
 import { DEFAULT_ITEM_TYPES } from './sizes.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.join(__dirname, '..', 'data');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
+// מאתר תיקיית נתונים בת-כתיבה. בסביבות serverless (כמו Vercel) מערכת הקבצים
+// היא לקריאה בלבד, ולכן נופלים אוטומטית ל-tmp כדי שהשרת לא יקרוס.
+// אזהרה: ב-tmp הנתונים אינם נשמרים לאורך זמן – ראו deploy/README.md.
+function resolveDataDir() {
+  const candidates = [
+    process.env.DATA_DIR,
+    path.join(__dirname, '..', 'data'),
+    path.join(os.tmpdir(), 'inventory-data'),
+  ].filter(Boolean);
+  for (const dir of candidates) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.accessSync(dir, fs.constants.W_OK);
+      return dir;
+    } catch {
+      // התיקייה אינה ניתנת לכתיבה – ננסה את המועמד הבא
+    }
+  }
+  throw new Error('לא נמצאה תיקייה בת-כתיבה לאחסון מסד הנתונים');
+}
+
+const DATA_DIR = resolveDataDir();
 const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'inventory.db');
 
 export const db = new DatabaseSync(DB_PATH);

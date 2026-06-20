@@ -1,0 +1,17 @@
+# פריסה ל-Render בלחיצת כפתור (קל למתחילים, עם HTTPS אוטומטי ושמירת נתונים).
+# Render קורא קובץ זה אוטומטית. ראו deploy/README.md להוראות מלאות.
+services:
+  - type: web
+    name: inventory
+    runtime: node
+    # תוכנית עם דיסק קבוע – חיונית כדי שהנתונים יישמרו (קובץ ה-SQLite).
+    plan: starter
+    startCommand: node --no-warnings server.js
+    envVars:
+      # מפנה את מסד הנתונים לדיסק הקבוע שמוגדר למטה.
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: inventory-data
+      mountPath: /var/data
+      sizeGB: 1
