@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { db, initSchema, seedAdmin, seedItemTypesForCompany } from './src/db.js';
 import { hashPassword, verifyPassword, newToken } from './src/auth.js';
 import { SIZE_SCHEMES, DEFAULT_ITEM_TYPES, sizeOptions, isValidScheme } from './src/sizes.js';
+import { parseSpreadsheet } from './src/xlsx.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -30,7 +31,7 @@ function readBody(req) {
     let data = '';
     req.on('data', (c) => {
       data += c;
-      if (data.length > 5e6) reject(new Error('גוף הבקשה גדול מדי'));
+      if (data.length > 25e6) reject(new Error('גוף הבקשה גדול מדי'));
     });
     req.on('end', () => {
       if (!data) return resolve({});
@@ -317,8 +318,8 @@ const api = {
     if (!items.length) return fail(ctx.res, 400, 'יש לבחור לפחות פריט אחד');
     const reqId = transaction(() => {
       const info = db
-        .prepare("INSERT INTO requisitions (user_id, status, note) VALUES (?, 'pending', ?)")
-        .run(ctx.user.id, ctx.body.note || null);
+        .prepare("INSERT INTO requisitions (user_id, status, note, site_id, employee_id) VALUES (?, 'pending', ?, ?, ?)")
+        .run(ctx.user.id, ctx.body.note || null, ctx.body.site_id || null, ctx.body.employee_id || null);
       const id = info.lastInsertRowid;
       const stmt = db.prepare('INSERT INTO requisition_items (requisition_id, product_id, quantity) VALUES (?, ?, ?)');
       for (const it of items) {
@@ -330,15 +331,16 @@ const api = {
     json(ctx.res, 201, { id: reqId });
   },
   async listRequisitions(ctx) {
+    const base = `SELECT r.*, u.username, s.name AS site_name, e.name AS employee_name
+      FROM requisitions r
+      JOIN users u ON u.id = r.user_id
+      LEFT JOIN sites s ON s.id = r.site_id
+      LEFT JOIN employees e ON e.id = r.employee_id`;
     let rows;
     if (ctx.user.role === 'admin') {
-      rows = db
-        .prepare('SELECT r.*, u.username FROM requisitions r JOIN users u ON u.id = r.user_id ORDER BY r.created_at DESC')
-        .all();
+      rows = db.prepare(base + ' ORDER BY r.created_at DESC').all();
     } else {
-      rows = db
-        .prepare('SELECT r.*, u.username FROM requisitions r JOIN users u ON u.id = r.user_id WHERE r.user_id = ? ORDER BY r.created_at DESC')
-        .all(ctx.user.id);
+      rows = db.prepare(base + ' WHERE r.user_id = ? ORDER BY r.created_at DESC').all(ctx.user.id);
     }
     for (const r of rows) r.items = requisitionItems(r.id);
     json(ctx.res, 200, rows);
@@ -397,6 +399,104 @@ const api = {
       )
       .all();
     json(ctx.res, 200, rows);
+  },
+
+  /* ---------------------- אתרים ---------------------- */
+  async listSites(ctx) {
+    const rows = db
+      .prepare(
+        `SELECT s.*, (SELECT COUNT(*) FROM employees e WHERE e.site_id = s.id) AS employee_count
+         FROM sites s ORDER BY s.name`
+      )
+      .all();
+    json(ctx.res, 200, rows);
+  },
+  async createSite(ctx) {
+    const { name, code } = ctx.body;
+    if (!name) return fail(ctx.res, 400, 'נא להזין שם אתר');
+    const exists = db.prepare('SELECT id FROM sites WHERE name = ?').get(name);
+    if (exists) return fail(ctx.res, 409, 'אתר בשם זה כבר קיים');
+    const info = db.prepare('INSERT INTO sites (name, code) VALUES (?, ?)').run(name, code || null);
+    json(ctx.res, 201, { id: info.lastInsertRowid });
+  },
+  async deleteSite(ctx) {
+    db.prepare('DELETE FROM sites WHERE id = ?').run(ctx.params.id);
+    json(ctx.res, 200, { ok: true });
+  },
+  // טעינה מרובה של אתרים (מאקסל/CSV או ידנית)
+  async bulkSites(ctx) {
+    const rows = Array.isArray(ctx.body.sites) ? ctx.body.sites : [];
+    let added = 0, skipped = 0;
+    transaction(() => {
+      const stmt = db.prepare('INSERT OR IGNORE INTO sites (name, code) VALUES (?, ?)');
+      for (const r of rows) {
+        const name = String(r.name || '').trim();
+        if (!name) { skipped++; continue; }
+        const info = stmt.run(name, r.code ? String(r.code).trim() : null);
+        if (info.changes) added++; else skipped++;
+      }
+    });
+    json(ctx.res, 200, { added, skipped });
+  },
+
+  /* ---------------------- עובדים ---------------------- */
+  async listEmployees(ctx) {
+    const siteId = ctx.query.get('site_id');
+    let sql = `SELECT e.*, s.name AS site_name FROM employees e LEFT JOIN sites s ON s.id = e.site_id`;
+    const args = [];
+    if (siteId) { sql += ' WHERE e.site_id = ?'; args.push(siteId); }
+    sql += ' ORDER BY e.name';
+    json(ctx.res, 200, db.prepare(sql).all(...args));
+  },
+  async createEmployee(ctx) {
+    const { name, employee_no, site_id } = ctx.body;
+    if (!name) return fail(ctx.res, 400, 'נא להזין שם עובד');
+    const info = db
+      .prepare('INSERT INTO employees (name, employee_no, site_id) VALUES (?, ?, ?)')
+      .run(name, employee_no || null, site_id || null);
+    json(ctx.res, 201, { id: info.lastInsertRowid });
+  },
+  async deleteEmployee(ctx) {
+    db.prepare('DELETE FROM employees WHERE id = ?').run(ctx.params.id);
+    json(ctx.res, 200, { ok: true });
+  },
+  // טעינה מרובה של עובדים; ניתן ליצור אתרים חדשים אוטומטית לפי שם האתר
+  async bulkEmployees(ctx) {
+    const rows = Array.isArray(ctx.body.employees) ? ctx.body.employees : [];
+    const createSites = ctx.body.create_sites !== false;
+    let added = 0, skipped = 0, sitesCreated = 0;
+    transaction(() => {
+      const findSite = db.prepare('SELECT id FROM sites WHERE name = ?');
+      const addSite = db.prepare('INSERT OR IGNORE INTO sites (name) VALUES (?)');
+      const addEmp = db.prepare('INSERT OR IGNORE INTO employees (name, employee_no, site_id) VALUES (?, ?, ?)');
+      for (const r of rows) {
+        const name = String(r.name || '').trim();
+        if (!name) { skipped++; continue; }
+        let siteId = null;
+        const siteName = String(r.site_name || '').trim();
+        if (siteName) {
+          let s = findSite.get(siteName);
+          if (!s && createSites) { addSite.run(siteName); sitesCreated++; s = findSite.get(siteName); }
+          if (s) siteId = s.id;
+        }
+        const info = addEmp.run(name, r.employee_no ? String(r.employee_no).trim() : null, siteId);
+        if (info.changes) added++; else skipped++;
+      }
+    });
+    json(ctx.res, 200, { added, skipped, sitesCreated });
+  },
+
+  /* ---------------------- ניתוח קובץ אקסל/CSV ---------------------- */
+  async importParse(ctx) {
+    const { filename, data } = ctx.body;
+    if (!data) return fail(ctx.res, 400, 'לא התקבל קובץ');
+    try {
+      const buf = Buffer.from(data, 'base64');
+      const rows = parseSpreadsheet(buf, filename || '');
+      json(ctx.res, 200, { rows: rows.slice(0, 5000), total: rows.length });
+    } catch (e) {
+      fail(ctx.res, 400, 'שגיאה בקריאת הקובץ: ' + e.message);
+    }
   },
 
   /* ---------------------- הצעות להזמנה (מתחת למינימום) ---------------------- */
@@ -654,6 +754,18 @@ route('GET', '/api/requisitions', api.listRequisitions, AUTH);
 route('POST', '/api/requisitions/:id/approve', api.approveRequisition, ADMIN);
 route('POST', '/api/requisitions/:id/reject', api.rejectRequisition, ADMIN);
 route('POST', '/api/requisitions/:id/collect', api.collectRequisition, AUTH);
+
+route('GET', '/api/sites', api.listSites, AUTH);
+route('POST', '/api/sites', api.createSite, ADMIN);
+route('DELETE', '/api/sites/:id', api.deleteSite, ADMIN);
+route('POST', '/api/sites/bulk', api.bulkSites, ADMIN);
+
+route('GET', '/api/employees', api.listEmployees, AUTH);
+route('POST', '/api/employees', api.createEmployee, ADMIN);
+route('DELETE', '/api/employees/:id', api.deleteEmployee, ADMIN);
+route('POST', '/api/employees/bulk', api.bulkEmployees, ADMIN);
+
+route('POST', '/api/import/parse', api.importParse, ADMIN);
 
 route('GET', '/api/shortages', api.listShortages, AUTH);
 route('GET', '/api/reorder-suggestions', api.reorderSuggestions, ADMIN);

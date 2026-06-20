@@ -150,6 +150,7 @@ const NAV = [
   { id: 'requisitions', label: 'ההזמנות שלי', icon: '📋', roles: ['user'] },
   { id: 'requisitions', label: 'אישור הזמנות', icon: '📋', roles: ['admin'], adminLabel: true },
   { id: 'inventory', label: 'ניהול מלאי', icon: '📦', roles: ['admin'] },
+  { id: 'directory', label: 'אתרים ועובדים', icon: '🏢', roles: ['admin'] },
   { id: 'shortages', label: 'חוסרים להשלמה', icon: '⚠️', roles: ['admin', 'user'] },
   { id: 'reorder', label: 'הזמנות רכש', icon: '🚚', roles: ['admin'] },
   { id: 'users', label: 'ניהול משתמשים', icon: '👥', roles: ['admin'] },
@@ -219,7 +220,8 @@ async function refreshAlerts() {
 function renderView() {
   const views = {
     dashboard: viewDashboard, browse: viewBrowse, requisitions: viewRequisitions,
-    inventory: viewInventory, shortages: viewShortages, reorder: viewReorder, users: viewUsers,
+    inventory: viewInventory, directory: viewDirectory, shortages: viewShortages,
+    reorder: viewReorder, users: viewUsers,
   };
   (views[state.view] || viewDashboard)();
 }
@@ -356,14 +358,21 @@ function cartBar() {
 function bindCartBar() {
   const v = $('#cart-view'); const s = $('#cart-submit');
   if (v) v.addEventListener('click', showCartModal);
-  if (s) s.addEventListener('click', submitCart);
+  if (s) s.addEventListener('click', showCartModal);
 }
-function showCartModal() {
+async function showCartModal() {
+  const [sites, emps] = await Promise.all([api('/sites'), api('/employees')]);
   modal(`<h2>פריטים בבקשה</h2>
     <div class="table-wrap"><table><thead><tr><th>פריט</th><th>כמות</th><th></th></tr></thead><tbody>
     ${state.cart.map((c, i) => `<tr><td>${h(c.label)}</td><td>${c.quantity}</td>
       <td><button class="btn sm red" data-rm="${i}">הסר</button></td></tr>`).join('')}
     </tbody></table></div>
+    <div class="field-row">
+      <div><label>עבור אתר (אופציונלי)</label><select id="cart-site"><option value="">— ללא —</option>
+        ${sites.map((s) => `<option value="${s.id}">${h(s.name)}</option>`).join('')}</select></div>
+      <div><label>עבור עובד (אופציונלי)</label><select id="cart-emp"><option value="">— ללא —</option>
+        ${emps.map((e) => `<option value="${e.id}">${h(e.name)}${e.site_name ? ' · ' + h(e.site_name) : ''}</option>`).join('')}</select></div>
+    </div>
     <label>הערה (אופציונלי)</label><textarea id="cart-note" rows="2"></textarea>
     <div class="modal-actions">
       <button class="btn primary" id="cart-do-submit">שליחה לאישור</button>
@@ -372,14 +381,17 @@ function showCartModal() {
   document.querySelectorAll('[data-rm]').forEach((b) => b.addEventListener('click', () => {
     state.cart.splice(Number(b.dataset.rm), 1); closeModal(); if (state.cart.length) showCartModal(); drawBrowse();
   }));
-  $('#cart-do-submit').addEventListener('click', () => submitCart($('#cart-note').value));
+  $('#cart-do-submit').addEventListener('click', () => submitCart({
+    note: $('#cart-note').value, site_id: $('#cart-site').value || null, employee_id: $('#cart-emp').value || null,
+  }));
 }
-async function submitCart(note) {
+async function submitCart(extra) {
   if (!state.cart.length) return toast('הבקשה ריקה', 'error');
+  const meta = extra && typeof extra === 'object' ? extra : {};
   try {
     await api('/requisitions', { method: 'POST', body: {
       items: state.cart.map((c) => ({ product_id: c.product_id, quantity: c.quantity })),
-      note: typeof note === 'string' ? note : null,
+      note: meta.note || null, site_id: meta.site_id || null, employee_id: meta.employee_id || null,
     } });
     state.cart = [];
     closeModal();
@@ -418,6 +430,8 @@ function reqCard(r, isAdmin) {
       <span class="muted">מאת ${h(r.username)} · ${h(r.created_at)}</span>
       <div class="spacer"></div>${actions}
     </div>
+    ${(r.site_name || r.employee_name) ? `<div class="muted" style="margin-bottom:6px">
+      ${r.employee_name ? '👤 ' + h(r.employee_name) : ''}${r.site_name ? ' · 🏢 ' + h(r.site_name) : ''}</div>` : ''}
     ${r.note ? `<div class="muted" style="margin-bottom:8px">הערה: ${h(r.note)}</div>` : ''}
     <div class="table-wrap"><table><thead><tr><th>פריט</th><th>כמות</th><th>מלאי</th></tr></thead>
       <tbody>${items}</tbody></table></div>
@@ -656,6 +670,164 @@ function editProductModal(p) {
       closeModal(); toast('עודכן', 'success'); drawInventory(); }
     catch (e) { toast(e.message, 'error'); }
   });
+}
+
+/* ================================================================
+   אתרים ועובדים – כולל ייבוא מאקסל / CSV
+   ================================================================ */
+async function viewDirectory() {
+  const main = $('#main');
+  main.innerHTML = `<h1 class="page-title">אתרים ועובדים</h1>
+    <p class="page-sub">ניהול אתרים ועובדים, כולל טעינה מקובץ אקסל (.xlsx) או CSV</p>
+    <div class="section">
+      <div class="toolbar">
+        <h3 style="margin:0">🏢 אתרים</h3><div class="spacer"></div>
+        <button class="btn" id="add-site">➕ אתר ידני</button>
+        <button class="btn primary" id="imp-sites">📥 ייבוא אתרים מאקסל</button>
+      </div>
+      <div id="sites-body"></div>
+    </div>
+    <div class="section">
+      <div class="toolbar">
+        <h3 style="margin:0">👤 עובדים</h3><div class="spacer"></div>
+        <button class="btn" id="add-emp">➕ עובד ידני</button>
+        <button class="btn primary" id="imp-emps">📥 ייבוא עובדים מאקסל</button>
+      </div>
+      <div id="emps-body"></div>
+    </div>`;
+  $('#add-site').addEventListener('click', addSiteModal);
+  $('#add-emp').addEventListener('click', addEmployeeModal);
+  $('#imp-sites').addEventListener('click', () => importWizard('sites'));
+  $('#imp-emps').addEventListener('click', () => importWizard('employees'));
+  drawDirectory();
+}
+async function drawDirectory() {
+  const [sites, emps] = await Promise.all([api('/sites'), api('/employees')]);
+  $('#sites-body').innerHTML = sites.length ? `<div class="table-wrap"><table>
+    <thead><tr><th>שם אתר</th><th>קוד</th><th>עובדים</th><th></th></tr></thead>
+    <tbody>${sites.map((s) => `<tr><td>${h(s.name)}</td><td>${h(s.code || '—')}</td>
+      <td>${s.employee_count}</td><td><button class="btn sm red" data-del-site="${s.id}">🗑</button></td></tr>`).join('')}
+    </tbody></table></div>` : `<div class="empty">אין אתרים. הוסיפו ידנית או ייבאו מאקסל.</div>`;
+  $('#emps-body').innerHTML = emps.length ? `<div class="table-wrap"><table>
+    <thead><tr><th>שם עובד</th><th>מספר עובד</th><th>אתר</th><th></th></tr></thead>
+    <tbody>${emps.map((e) => `<tr><td>${h(e.name)}</td><td>${h(e.employee_no || '—')}</td>
+      <td>${h(e.site_name || '—')}</td><td><button class="btn sm red" data-del-emp="${e.id}">🗑</button></td></tr>`).join('')}
+    </tbody></table></div>` : `<div class="empty">אין עובדים. הוסיפו ידנית או ייבאו מאקסל.</div>`;
+  document.querySelectorAll('[data-del-site]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('למחוק אתר זה?')) return;
+    await api('/sites/' + b.dataset.delSite, { method: 'DELETE' }); toast('נמחק'); drawDirectory();
+  }));
+  document.querySelectorAll('[data-del-emp]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('למחוק עובד זה?')) return;
+    await api('/employees/' + b.dataset.delEmp, { method: 'DELETE' }); toast('נמחק'); drawDirectory();
+  }));
+}
+function addSiteModal() {
+  modal(`<h2>אתר חדש</h2><label>שם האתר</label><input id="s-name">
+    <label>קוד (אופציונלי)</label><input id="s-code">
+    <div class="modal-actions"><button class="btn primary" id="s-save">שמירה</button>
+    <button class="btn" onclick="closeModal()">ביטול</button></div>`);
+  $('#s-save').addEventListener('click', async () => {
+    try { await api('/sites', { method: 'POST', body: { name: $('#s-name').value.trim(), code: $('#s-code').value.trim() } });
+      closeModal(); toast('נוסף', 'success'); drawDirectory(); } catch (e) { toast(e.message, 'error'); }
+  });
+}
+async function addEmployeeModal() {
+  const sites = await api('/sites');
+  modal(`<h2>עובד חדש</h2><label>שם העובד</label><input id="emp-name">
+    <label>מספר עובד (אופציונלי)</label><input id="emp-no">
+    <label>אתר (אופציונלי)</label><select id="emp-site"><option value="">— ללא —</option>
+      ${sites.map((s) => `<option value="${s.id}">${h(s.name)}</option>`).join('')}</select>
+    <div class="modal-actions"><button class="btn primary" id="emp-save">שמירה</button>
+    <button class="btn" onclick="closeModal()">ביטול</button></div>`);
+  $('#emp-save').addEventListener('click', async () => {
+    try { await api('/employees', { method: 'POST', body: {
+      name: $('#emp-name').value.trim(), employee_no: $('#emp-no').value.trim(), site_id: $('#emp-site').value || null } });
+      closeModal(); toast('נוסף', 'success'); drawDirectory(); } catch (e) { toast(e.message, 'error'); }
+  });
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(',')[1]);
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+}
+// אשף ייבוא: העלאה -> תצוגה מקדימה -> מיפוי עמודות -> ייבוא
+function importWizard(kind) {
+  const isSites = kind === 'sites';
+  modal(`<h2>ייבוא ${isSites ? 'אתרים' : 'עובדים'} מקובץ</h2>
+    <label>בחרו קובץ (.xlsx או .csv)</label>
+    <input type="file" id="imp-file" accept=".xlsx,.csv">
+    <div id="imp-preview"></div>`);
+  $('#imp-file').addEventListener('change', async (ev) => {
+    const file = ev.target.files[0];
+    if (!file) return;
+    try {
+      const data = await fileToBase64(file);
+      const res = await api('/import/parse', { method: 'POST', body: { filename: file.name, data } });
+      renderImportPreview(kind, res.rows, res.total);
+    } catch (e) { toast(e.message, 'error'); }
+  });
+}
+function renderImportPreview(kind, rows, total) {
+  const isSites = kind === 'sites';
+  if (!rows.length) { $('#imp-preview').innerHTML = `<div class="empty">לא נמצאו שורות בקובץ.</div>`; return; }
+  const colCount = Math.max(...rows.map((r) => r.length));
+  const colOptions = (includeNone) =>
+    (includeNone ? `<option value="-1">— ללא —</option>` : '') +
+    Array.from({ length: colCount }, (_, i) => `<option value="${i}">עמודה ${i + 1}${rows[0][i] ? ' (' + h(rows[0][i]) + ')' : ''}</option>`).join('');
+  const preview = rows.slice(0, 8);
+  let mapping = `<label><input type="checkbox" id="imp-header" checked style="width:auto"> השורה הראשונה היא כותרת (לא תיובא)</label>
+    <div class="field-row" style="margin-top:10px">
+      <div><label>עמודת ${isSites ? 'שם אתר' : 'שם עובד'} (חובה)</label><select id="map-name">${colOptions(false)}</select></div>`;
+  if (isSites) {
+    mapping += `<div><label>עמודת קוד</label><select id="map-code">${colOptions(true)}</select></div>`;
+  } else {
+    mapping += `<div><label>עמודת מספר עובד</label><select id="map-no">${colOptions(true)}</select></div>
+      <div><label>עמודת אתר</label><select id="map-site">${colOptions(true)}</select></div>`;
+  }
+  mapping += `</div>`;
+  if (!isSites) mapping += `<label><input type="checkbox" id="imp-create-sites" checked style="width:auto"> ליצור אתרים חדשים אוטומטית לפי שם האתר</label>`;
+  $('#imp-preview').innerHTML = `
+    <div class="muted" style="margin:12px 0 6px">נמצאו ${total} שורות. תצוגה מקדימה:</div>
+    <div class="table-wrap"><table><tbody>
+      ${preview.map((r) => `<tr>${Array.from({ length: colCount }, (_, i) => `<td>${h(r[i] || '')}</td>`).join('')}</tr>`).join('')}
+    </tbody></table></div>
+    ${mapping}
+    <div class="modal-actions"><button class="btn primary" id="imp-go">ייבוא</button>
+    <button class="btn" onclick="closeModal()">ביטול</button></div>`;
+  $('#imp-go').addEventListener('click', () => doImport(kind, rows));
+}
+async function doImport(kind, rows) {
+  const isSites = kind === 'sites';
+  const skipHeader = $('#imp-header').checked;
+  const data = skipHeader ? rows.slice(1) : rows;
+  const nameCol = Number($('#map-name').value);
+  try {
+    let res;
+    if (isSites) {
+      const codeCol = Number($('#map-code').value);
+      const sites = data.map((r) => ({ name: r[nameCol], code: codeCol >= 0 ? r[codeCol] : null }));
+      res = await api('/sites/bulk', { method: 'POST', body: { sites } });
+      toast(`יובאו ${res.added} אתרים (${res.skipped} דולגו)`, 'success');
+    } else {
+      const noCol = Number($('#map-no').value);
+      const siteCol = Number($('#map-site').value);
+      const employees = data.map((r) => ({
+        name: r[nameCol],
+        employee_no: noCol >= 0 ? r[noCol] : null,
+        site_name: siteCol >= 0 ? r[siteCol] : null,
+      }));
+      const create_sites = $('#imp-create-sites').checked;
+      res = await api('/employees/bulk', { method: 'POST', body: { employees, create_sites } });
+      toast(`יובאו ${res.added} עובדים (${res.sitesCreated} אתרים נוצרו, ${res.skipped} דולגו)`, 'success');
+    }
+    closeModal();
+    drawDirectory();
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 /* ================================================================
