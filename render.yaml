@@ -1,17 +1,23 @@
-# פריסה ל-Render בלחיצת כפתור (קל למתחילים, עם HTTPS אוטומטי ושמירת נתונים).
+# פריסה ל-Render בלחיצת כפתור (קל למתחילים, עם HTTPS אוטומטי).
 # Render קורא קובץ זה אוטומטית. ראו deploy/README.md להוראות מלאות.
+#
+# כברירת מחדל מוגדרת תוכנית חינמית (free) – להתחלה מהירה וללא תשלום, כדי לראות
+# את האפליקציה עובדת. בתוכנית החינמית הנתונים נמחקים בכל הפעלה מחדש.
+#
+# כדי שהנתונים יישָׁמרו לתמיד (מומלץ לשימוש אמיתי): שנו plan ל-starter,
+# בטלו את ההערה משלוש שורות ה-disk וה-DATA_DIR למטה, ושמרו.
 services:
   - type: web
     name: inventory
     runtime: node
-    # תוכנית עם דיסק קבוע – חיונית כדי שהנתונים יישמרו (קובץ ה-SQLite).
-    plan: starter
+    plan: free
     startCommand: node --no-warnings server.js
-    envVars:
-      # מפנה את מסד הנתונים לדיסק הקבוע שמוגדר למטה.
-      - key: DATA_DIR
-        value: /var/data
-    disk:
-      name: inventory-data
-      mountPath: /var/data
-      sizeGB: 1
+    # --- שמירת נתונים קבועה (בתשלום ~$7/חודש) – בטלו הערה כדי להפעיל: ---
+    # plan: starter
+    # envVars:
+    #   - key: DATA_DIR
+    #     value: /var/data
+    # disk:
+    #   name: inventory-data
+    #   mountPath: /var/data
+    #   sizeGB: 1
